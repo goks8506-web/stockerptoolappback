@@ -55,6 +55,7 @@ const generatePDFBuffer = (data) => {
     const bill_number = safeStr(data.bill_number || 'N/A');
     const bill_date = data.bill_date || null;
     const customer_name = safeStr(data.customer_name || 'N/A');
+    const phone = safeStr(data.phone || '');
     const address = safeStr(data.address || '');
     const gstin = safeStr(data.gstin || '');
     const lr_number = safeStr(data.lr_number || '');
@@ -88,8 +89,11 @@ const generatePDFBuffer = (data) => {
     doc.rect(leftX, startY, 250, 70).fillColor('#f8fafc').fill().strokeColor('#cbd5e1').stroke();
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#64748b').text('CUSTOMER / PARTY DETAILS', leftX + 10, startY + 8);
     doc.font('Helvetica-Bold').fontSize(11).fillColor('#0f172a').text(customer_name, leftX + 10, startY + 20);
-    doc.font('Helvetica').fontSize(9).fillColor('#334155').text(`Address: ${address || '—'}`, leftX + 10, startY + 35);
-    if (gstin) doc.font('Helvetica').fontSize(9).fillColor('#334155').text(`GSTIN: ${gstin}`, leftX + 10, startY + 48);
+    doc.font('Helvetica').fontSize(9).fillColor('#334155').text(`Address: ${address || '—'}`, leftX + 10, startY + 34);
+    const contactLine = [phone ? `Phone: ${phone}` : '', gstin ? `GSTIN: ${gstin}` : ''].filter(Boolean).join(' | ');
+    if (contactLine) {
+      doc.font('Helvetica').fontSize(8.5).fillColor('#334155').text(contactLine, leftX + 10, startY + 48);
+    }
 
     // Bill Info Box
     doc.rect(rightX, startY, 250, 70).fillColor('#f8fafc').fill().strokeColor('#cbd5e1').stroke();
@@ -221,6 +225,7 @@ exports.createBooking = async (req, res) => {
   try {
     const {
       customer_name,
+      phone,
       address,
       gstin,
       lr_number,
@@ -243,20 +248,22 @@ exports.createBooking = async (req, res) => {
       performed_by,   // ← NEW: username sent from frontend
     } = req.body;
 
-    if (!customer_name || !items.length || !toLoc || !through) {
-      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    if (!customer_name?.trim() || !items.length) {
+      return res.status(400).json({ success: false, message: 'Customer name and at least one item are required' });
     }
 
     await client.query('BEGIN');
+    await client.query('ALTER TABLE public.bookings ADD COLUMN IF NOT EXISTS phone TEXT');
 
     let finalItems = items;
-    let finalCustomerName = customer_name;
-    let finalAddress = address || '';
-    let finalGstin = gstin || '';
-    let finalLrNumber = lr_number || '';
-    let finalFrom = fromLoc;
-    let finalTo = toLoc;
-    let finalThrough = through;
+    let finalCustomerName = customer_name.trim();
+    let finalPhone = phone?.trim() || '';
+    let finalAddress = address?.trim() || '';
+    let finalGstin = gstin?.trim() || '';
+    let finalLrNumber = lr_number?.trim() || '';
+    let finalFrom = fromLoc?.trim() || 'SIVAKASI';
+    let finalTo = toLoc?.trim() || finalAddress || finalCustomerName || 'SIVAKASI';
+    let finalThrough = through?.trim() || 'DIRECT';
 
     // If from challan: load base data from delivery, override with payload
     if (from_challan && challan_id) {
@@ -276,8 +283,8 @@ exports.createBooking = async (req, res) => {
       finalGstin = gstin || challan.gstin || '';
       finalLrNumber = lr_number || challan.lr_number || '';
       finalFrom = fromLoc || challan.from || 'SIVAKASI';
-      finalTo = toLoc || challan.to || '';
-      finalThrough = through || challan.through || '';
+      finalTo = toLoc || challan.to || finalAddress || 'SIVAKASI';
+      finalThrough = through || challan.through || 'DIRECT';
 
       finalItems = items.length > 0 ? items : (typeof challan.items === 'string' ? JSON.parse(challan.items) : challan.items || []);
 
@@ -393,11 +400,11 @@ exports.createBooking = async (req, res) => {
 
     await client.query(
       `INSERT INTO public.bookings (
-        bill_number, bill_date, customer_name, address, gstin, lr_number, agent_name,
+        bill_number, bill_date, customer_name, phone, address, gstin, lr_number, agent_name,
         "from", "to", "through", stock_from, items, total, extra_charges, from_challan
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
       [
-        bill_number, bill_date, finalCustomerName, finalAddress, finalGstin, finalLrNumber,
+        bill_number, bill_date, finalCustomerName, finalPhone, finalAddress, finalGstin, finalLrNumber,
         agent_name, finalFrom, finalTo, finalThrough, stock_from || finalFrom,
         JSON.stringify(processedItems), grandTotal,
         JSON.stringify({
@@ -412,6 +419,7 @@ exports.createBooking = async (req, res) => {
       bill_number,
       bill_date,
       customer_name: finalCustomerName,
+      phone: finalPhone,
       address: finalAddress,
       gstin: finalGstin,
       lr_number: finalLrNumber,
@@ -564,18 +572,20 @@ exports.getBookings = async (req, res) => {
 
 exports.getCustomers = async (req, res) => {
   try {
+    await pool.query('ALTER TABLE public.bookings ADD COLUMN IF NOT EXISTS phone TEXT');
     const result = await pool.query(`
       SELECT DISTINCT ON (customer_name)
-        customer_name, address, gstin, lr_number, agent_name, "from", "to", "through"
+        customer_name, COALESCE(phone, '') as phone, address, gstin, lr_number, agent_name, "from", "to", "through"
       FROM public.bookings
       WHERE customer_name IS NOT NULL AND customer_name != ''
       ORDER BY customer_name, created_at DESC
     `);
 
     const customers = result.rows.map(row => ({
-      label: row.customer_name,
+      label: row.customer_name + (row.phone ? ` (${row.phone})` : (row.to ? ` (${row.to})` : '')),
       value: {
         name: row.customer_name,
+        phone: row.phone || '',
         address: row.address || '',
         gstin: row.gstin || '',
         lr_number: row.lr_number || '',

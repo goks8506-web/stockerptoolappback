@@ -108,7 +108,17 @@ exports.updateProduct = async (req, res) => {
 
 exports.getProducts = async (req, res) => {
   try {
-    if (productsCache && (Date.now() - productsCacheTime < 4000)) {
+    const searchFilter = (req.query.q || req.query.search || '').trim().toLowerCase();
+
+    if (productsCache && (Date.now() - productsCacheTime < 300000)) {
+      if (searchFilter) {
+        const filtered = productsCache.filter(p =>
+          (p.productname || '').toLowerCase().includes(searchFilter) ||
+          (p.brand || '').toLowerCase().includes(searchFilter) ||
+          (p.product_type || '').toLowerCase().includes(searchFilter)
+        );
+        return res.json(filtered.slice(0, 100));
+      }
       return res.json(productsCache);
     }
 

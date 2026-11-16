@@ -20,6 +20,7 @@ const {
   getTransferChallanPDF,
   getGodownSnapshot,
   getGodownSummaryReport,
+  getAvailableStockForTransfer,
 } = require('../Controller/Godown.controller');
 
 router.post('/godowns', addGodown);
@@ -41,6 +42,7 @@ router.post('/stock/bulk', bulkAllocate);
 router.delete('/godowns/:godown_id/stock/:stock_id', deleteStockEntry);
 
 // Transfer
+router.get('/stock/available-to-transfer', getAvailableStockForTransfer);
 router.post('/stock/transfer', transferStock);
 router.post('/godowns/:sourceGodownId/stock/:stockId/transfer', transferStock);
 

@@ -527,6 +527,12 @@ exports.exportGodownStockToExcel = async (req, res) => {
         { header: 'Customer / Note', key: 'customer_name', width: 40 },
       ];
 
+      // Enable Excel dropdown autofilters on header row
+      sheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: 1, column: sheet.columns.length }
+      };
+
       historyResult.rows.forEach((row, index) => {
         const formattedDate = row.date
           ? new Date(row.date).toLocaleString('en-IN', {
@@ -808,219 +814,266 @@ exports.deleteStockEntry = async (req, res) => {
   }
 };
 
+exports.getAvailableStockForTransfer = async (req, res) => {
+  try {
+    const { search = '', godown_id } = req.query;
+    let query = `
+      SELECT 
+        s.id AS stock_id,
+        s.godown_id,
+        g.name AS godown_name,
+        s.product_type,
+        s.productname,
+        s.brand,
+        s.current_cases,
+        s.per_case,
+        COALESCE(b.agent_name, '-') AS agent_name,
+        ROUND(s.current_cases * GREATEST(1, COALESCE(s.per_case, 1)))::INT AS total_pieces,
+        FLOOR(ROUND(s.current_cases * GREATEST(1, COALESCE(s.per_case, 1))) / GREATEST(1, COALESCE(s.per_case, 1)))::INT AS full_cases,
+        (ROUND(s.current_cases * GREATEST(1, COALESCE(s.per_case, 1)))::BIGINT % GREATEST(1, COALESCE(s.per_case, 1)))::INT AS loose_pieces
+      FROM public.stock s
+      JOIN public.godown g ON s.godown_id = g.id
+      LEFT JOIN public.brand b ON (s.brand_id = b.id OR LOWER(REPLACE(s.brand, ' ', '_')) = LOWER(b.name) OR LOWER(s.brand) = LOWER(b.name))
+      WHERE s.current_cases > 0
+    `;
+    const params = [];
+
+    if (godown_id) {
+      params.push(godown_id);
+      query += ` AND s.godown_id = $${params.length}`;
+    }
+
+    if (search && search.trim()) {
+      params.push(`%${search.trim()}%`);
+      query += ` AND (s.productname ILIKE $${params.length} OR s.brand ILIKE $${params.length} OR g.name ILIKE $${params.length} OR s.product_type ILIKE $${params.length})`;
+    }
+
+    query += ` ORDER BY s.productname ASC, g.name ASC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('getAvailableStockForTransfer error:', err.message);
+    res.status(500).json({ message: 'Failed to fetch available stocks' });
+  }
+};
+
 exports.transferStock = async (req, res) => {
   const client = await pool.connect();
   try {
-    const {
-      source_stock_id,
-      target_godown_id,
-      cases_transferred,
-      loose_pieces_transferred,
-      transfer_date,
-      added_by,
-      // Challan fields
-      transport_name,
-      lr_number,
-      delivery_person,
-      from_place,
-      to_place,
-    } = req.body;
+    const rawItems = Array.isArray(req.body.transfers)
+      ? req.body.transfers
+      : (Array.isArray(req.body) ? req.body : [req.body]);
 
-    if (!source_stock_id || !target_godown_id) {
-      return res.status(400).json({ message: 'Invalid input' });
-    }
+    const added_by = req.body.added_by || rawItems[0]?.added_by;
     if (!added_by) {
       return res.status(400).json({ message: 'Added by (username) is required' });
     }
 
+    if (rawItems.length === 0 || !rawItems[0]?.source_stock_id || !rawItems[0]?.target_godown_id) {
+      return res.status(400).json({ message: 'No valid transfer items provided' });
+    }
+
     await client.query('BEGIN');
 
-    // ─── Get source stock ───────────────────────────────────────────────
-    const sourceStockRes = await client.query(
-      `SELECT s.*, g.name as godown_name
-       FROM public.stock s
-       JOIN public.godown g ON s.godown_id = g.id
-       WHERE s.id = $1 FOR UPDATE`,
-      [source_stock_id]
-    );
+    // Create challan table & sequence if not exists
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.godown_transfer_challans (
+        id SERIAL PRIMARY KEY,
+        challan_number TEXT UNIQUE,
+        transfer_date DATE DEFAULT CURRENT_DATE,
+        source_godown_id INTEGER,
+        target_godown_id INTEGER,
+        source_godown_name TEXT,
+        target_godown_name TEXT,
+        product_details JSONB DEFAULT '[]',
+        transport_name TEXT,
+        lr_number TEXT,
+        delivery_person TEXT,
+        performed_by TEXT,
+        from_place TEXT,
+        to_place TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await client.query(`CREATE SEQUENCE IF NOT EXISTS challan_sequence START 1`);
 
-    if (sourceStockRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Source stock not found' });
-    }
+    const challansCreated = [];
+    const challansByPair = {}; // key: `${source_godown_id}_${target_godown_id}`
 
-    const source = sourceStockRes.rows[0];
-    const sourceCurrentNum = parseFloat(source.current_cases || 0);
-    const pCase = Math.max(1, parseInt(source.per_case || 1));
+    for (const item of rawItems) {
+      const source_stock_id = item.source_stock_id;
+      const target_godown_id = item.target_godown_id;
+      if (!source_stock_id || !target_godown_id) continue;
 
-    let totalPcsToTransfer = 0;
-    let effectiveCasesToTransfer = 0;
-
-    if (req.body.cases !== undefined || loose_pieces_transferred !== undefined || req.body.loose_pieces !== undefined) {
-      const cVal = parseFloat(req.body.cases !== undefined ? req.body.cases : cases_transferred) || 0;
-      const lVal = parseFloat(loose_pieces_transferred || req.body.loose_pieces || 0) || 0;
-      totalPcsToTransfer = Math.round((cVal * pCase) + lVal);
-      effectiveCasesToTransfer = Math.round((totalPcsToTransfer / pCase) * 10000) / 10000;
-    } else {
-      effectiveCasesToTransfer = parseFloat(cases_transferred) || 0;
-      totalPcsToTransfer = Math.round(effectiveCasesToTransfer * pCase);
-    }
-
-    if (totalPcsToTransfer <= 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Valid cases or loose pieces to transfer is required' });
-    }
-
-    const sourceTotalPcs = Math.round(sourceCurrentNum * pCase);
-    if (totalPcsToTransfer > sourceTotalPcs) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Insufficient cases' });
-    }
-
-    const newCurrent = Math.round(((sourceTotalPcs - totalPcsToTransfer) / pCase) * 10000) / 10000;
-    const newTaken = parseFloat(source.taken_cases || 0) + effectiveCasesToTransfer;
-    const customDate = transfer_date || null;
-
-    // Update source stock
-    await client.query(
-      `UPDATE public.stock 
-       SET current_cases = $1, taken_cases = $2, last_taken_date = COALESCE($3, CURRENT_TIMESTAMP)
-       WHERE id = $4`,
-      [newCurrent, newTaken, customDate, source_stock_id]
-    );
-
-    // Get target godown name
-    const targetGodownRes = await client.query(
-      'SELECT name FROM public.godown WHERE id = $1',
-      [target_godown_id]
-    );
-
-    if (targetGodownRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Target godown not found' });
-    }
-
-    const targetName = targetGodownRes.rows[0].name;
-    const perCaseTotal = totalPcsToTransfer;
-
-    // ─── History for SOURCE (taken) ─────────────────────────────────────
-    await client.query(
-      `INSERT INTO public.stock_history 
-       (stock_id, action, cases, per_case_total, added_by, taken_by, customer_name, date)
-       VALUES ($1, 'taken', $2, $3, $4, $4, $5, COALESCE($6, CURRENT_TIMESTAMP))`,
-      [
-        source_stock_id,
-        effectiveCasesToTransfer,
-        perCaseTotal,
-        added_by,
-        `TRANSFERRED TO ${targetName.replace(/_/g, ' ').toUpperCase()}`,
-        customDate
-      ]
-    );
-
-    // ─── Target stock logic ─────────────────────────────────────────────
-    const existingTarget = await client.query(
-      `SELECT id, current_cases FROM public.stock 
-       WHERE godown_id = $1 AND product_type = $2 AND productname = $3 AND brand = $4`,
-      [target_godown_id, source.product_type, source.productname, source.brand]
-    );
-
-    let targetStockId;
-
-    if (existingTarget.rows.length > 0) {
-      targetStockId = existingTarget.rows[0].id;
-      const targetCurrentNum = parseFloat(existingTarget.rows[0].current_cases || 0);
-      const newTargetCurrent = targetCurrentNum + effectiveCasesToTransfer;
-
-      await client.query(
-        `UPDATE public.stock 
-         SET current_cases = $1, date_added = COALESCE($2, CURRENT_TIMESTAMP)
-         WHERE id = $3`,
-        [newTargetCurrent, customDate, targetStockId]
+      const sourceStockRes = await client.query(
+        `SELECT s.*, g.name as godown_name
+         FROM public.stock s
+         JOIN public.godown g ON s.godown_id = g.id
+         WHERE s.id = $1 FOR UPDATE`,
+        [source_stock_id]
       );
-    } else {
-      const formattedBrand = source.brand.toLowerCase().replace(/\s+/g, '_');
-      let brandRes = await client.query('SELECT id FROM public.brand WHERE name = $1', [formattedBrand]);
 
-      if (brandRes.rows.length === 0) {
-        brandRes = await client.query(
-          'INSERT INTO public.brand (name) VALUES ($1) RETURNING id',
-          [formattedBrand]
-        );
+      if (sourceStockRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: `Source stock #${source_stock_id} not found` });
       }
 
-      const brandId = brandRes.rows[0].id;
+      const source = sourceStockRes.rows[0];
+      const sourceCurrentNum = parseFloat(source.current_cases || 0);
+      const pCase = Math.max(1, parseInt(source.per_case || 1));
 
-      const insertRes = await client.query(
-        `INSERT INTO public.stock 
-         (godown_id, product_type, productname, brand, brand_id, current_cases, per_case, date_added)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, CURRENT_TIMESTAMP))
-         RETURNING id`,
+      let totalPcsToTransfer = 0;
+      let effectiveCasesToTransfer = 0;
+
+      if (item.cases !== undefined || item.loose_pieces_transferred !== undefined || item.loose_pieces !== undefined) {
+        const cVal = parseFloat(item.cases !== undefined ? item.cases : item.cases_transferred) || 0;
+        const lVal = parseFloat(item.loose_pieces_transferred || item.loose_pieces || 0) || 0;
+        totalPcsToTransfer = Math.round((cVal * pCase) + lVal);
+        effectiveCasesToTransfer = Math.round((totalPcsToTransfer / pCase) * 10000) / 10000;
+      } else {
+        effectiveCasesToTransfer = parseFloat(item.cases_transferred) || 0;
+        totalPcsToTransfer = Math.round(effectiveCasesToTransfer * pCase);
+      }
+
+      if (totalPcsToTransfer <= 0) continue;
+
+      const sourceTotalPcs = Math.round(sourceCurrentNum * pCase);
+      if (totalPcsToTransfer > sourceTotalPcs) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: `Insufficient stock for ${source.productname} (${source.godown_name}). Available: ${formatCasesAndPcs(sourceCurrentNum, pCase)}`
+        });
+      }
+
+      const newCurrent = Math.round(((sourceTotalPcs - totalPcsToTransfer) / pCase) * 10000) / 10000;
+      const newTaken = parseFloat(source.taken_cases || 0) + effectiveCasesToTransfer;
+      const customDate = item.transfer_date || req.body.transfer_date || null;
+
+      // Update source stock
+      await client.query(
+        `UPDATE public.stock 
+         SET current_cases = $1, taken_cases = $2, last_taken_date = COALESCE($3, CURRENT_TIMESTAMP)
+         WHERE id = $4`,
+        [newCurrent, newTaken, customDate, source_stock_id]
+      );
+
+      // Get target godown name
+      const targetGodownRes = await client.query('SELECT name FROM public.godown WHERE id = $1', [target_godown_id]);
+      if (targetGodownRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: `Target godown #${target_godown_id} not found` });
+      }
+      const targetName = targetGodownRes.rows[0].name;
+
+      // History for SOURCE (taken)
+      await client.query(
+        `INSERT INTO public.stock_history 
+         (stock_id, action, cases, per_case_total, added_by, taken_by, customer_name, date)
+         VALUES ($1, 'taken', $2, $3, $4, $4, $5, COALESCE($6, CURRENT_TIMESTAMP))`,
         [
-          target_godown_id,
-          source.product_type,
-          source.productname,
-          source.brand,
-          brandId,
+          source_stock_id,
           effectiveCasesToTransfer,
-          source.per_case,
+          totalPcsToTransfer,
+          added_by,
+          `TRANSFERRED TO ${targetName.replace(/_/g, ' ').toUpperCase()}`,
           customDate
         ]
       );
-      targetStockId = insertRes.rows[0].id;
-    }
 
-    // ─── History for TARGET (added) ─────────────────────────────────────
-    await client.query(
-      `INSERT INTO public.stock_history 
-       (stock_id, action, cases, per_case_total, added_by, customer_name, date)
-       VALUES ($1, 'added', $2, $3, $4, $5, COALESCE($6, CURRENT_TIMESTAMP))`,
-      [
-        targetStockId,
-        effectiveCasesToTransfer,
-        perCaseTotal,
-        added_by,
-        `TRANSFERRED FROM ${source.godown_name.replace(/_/g, ' ').toUpperCase()}`,
-        customDate
-      ]
-    );
+      // Target stock logic
+      const existingTarget = await client.query(
+        `SELECT id, current_cases FROM public.stock 
+         WHERE godown_id = $1 AND product_type = $2 AND productname = $3 AND brand = $4`,
+        [target_godown_id, source.product_type, source.productname, source.brand]
+      );
 
-    // ─── Create Transfer Challan Record ─────────────────────────────────
-    let challan_id = null;
-    let challan_number = null;
-    try {
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS public.godown_transfer_challans (
-          id SERIAL PRIMARY KEY,
-          challan_number TEXT UNIQUE,
-          transfer_date DATE DEFAULT CURRENT_DATE,
-          source_godown_id INTEGER,
-          target_godown_id INTEGER,
-          source_godown_name TEXT,
-          target_godown_name TEXT,
-          product_details JSONB DEFAULT '[]',
-          transport_name TEXT,
-          lr_number TEXT,
-          delivery_person TEXT,
-          performed_by TEXT,
-          from_place TEXT,
-          to_place TEXT,
-          created_at TIMESTAMP DEFAULT NOW()
-        )
-      `);
-      await client.query(`CREATE SEQUENCE IF NOT EXISTS challan_sequence START 1`);
-      const seqRes = await client.query(`SELECT nextval('challan_sequence') AS seq`);
-      challan_number = `CHN-${String(seqRes.rows[0].seq).padStart(4, '0')}`;
+      let targetStockId;
+      if (existingTarget.rows.length > 0) {
+        targetStockId = existingTarget.rows[0].id;
+        const targetCurrentNum = parseFloat(existingTarget.rows[0].current_cases || 0);
+        const newTargetCurrent = targetCurrentNum + effectiveCasesToTransfer;
+        await client.query(
+          `UPDATE public.stock SET current_cases = $1, date_added = COALESCE($2, CURRENT_TIMESTAMP) WHERE id = $3`,
+          [newTargetCurrent, customDate, targetStockId]
+        );
+      } else {
+        const formattedBrand = source.brand.toLowerCase().replace(/\s+/g, '_');
+        let brandRes = await client.query('SELECT id FROM public.brand WHERE name = $1', [formattedBrand]);
+        if (brandRes.rows.length === 0) {
+          brandRes = await client.query('INSERT INTO public.brand (name) VALUES ($1) RETURNING id', [formattedBrand]);
+        }
+        const brandId = brandRes.rows[0].id;
 
-      const productDetails = [{
+        const insertRes = await client.query(
+          `INSERT INTO public.stock 
+           (godown_id, product_type, productname, brand, brand_id, current_cases, per_case, date_added)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, CURRENT_TIMESTAMP)) RETURNING id`,
+          [
+            target_godown_id,
+            source.product_type,
+            source.productname,
+            source.brand,
+            brandId,
+            effectiveCasesToTransfer,
+            source.per_case,
+            customDate
+          ]
+        );
+        targetStockId = insertRes.rows[0].id;
+      }
+
+      // History for TARGET (added)
+      await client.query(
+        `INSERT INTO public.stock_history 
+         (stock_id, action, cases, per_case_total, added_by, customer_name, date)
+         VALUES ($1, 'added', $2, $3, $4, $5, COALESCE($6, CURRENT_TIMESTAMP))`,
+        [
+          targetStockId,
+          effectiveCasesToTransfer,
+          totalPcsToTransfer,
+          added_by,
+          `TRANSFERRED FROM ${source.godown_name.replace(/_/g, ' ').toUpperCase()}`,
+          customDate
+        ]
+      );
+
+      // Collect for Challan
+      const pairKey = `${source.godown_id}_${target_godown_id}`;
+      if (!challansByPair[pairKey]) {
+        challansByPair[pairKey] = {
+          source_godown_id: source.godown_id,
+          target_godown_id: target_godown_id,
+          source_godown_name: source.godown_name,
+          target_godown_name: targetName,
+          customDate: customDate,
+          transport_name: item.transport_name || req.body.transport_name || null,
+          lr_number: item.lr_number || req.body.lr_number || null,
+          delivery_person: item.delivery_person || req.body.delivery_person || null,
+          from_place: item.from_place || req.body.from_place || source.godown_name.replace(/_/g, ' ').toUpperCase(),
+          to_place: item.to_place || req.body.to_place || targetName.replace(/_/g, ' ').toUpperCase(),
+          products: []
+        };
+      }
+
+      challansByPair[pairKey].products.push({
         productname: source.productname,
         brand: source.brand,
         product_type: source.product_type,
         cases: formatCasesAndPcs(effectiveCasesToTransfer, pCase),
         case_count: effectiveCasesToTransfer,
         per_case: source.per_case,
-        total_qty: perCaseTotal
-      }];
+        total_qty: totalPcsToTransfer
+      });
+    }
+
+    // Now insert Challan record for each pair
+    for (const pairKey of Object.keys(challansByPair)) {
+      const pair = challansByPair[pairKey];
+      if (pair.products.length === 0) continue;
+
+      const seqRes = await client.query(`SELECT nextval('challan_sequence') AS seq`);
+      const challan_number = `CHN-${String(seqRes.rows[0].seq).padStart(4, '0')}`;
 
       const challanRes = await client.query(
         `INSERT INTO public.godown_transfer_challans
@@ -1031,31 +1084,43 @@ exports.transferStock = async (req, res) => {
          RETURNING id`,
         [
           challan_number,
-          customDate,
-          source.godown_id,
-          target_godown_id,
-          sourceName,
-          targetName,
-          JSON.stringify(productDetails),
-          transport_name || null,
-          lr_number || null,
-          delivery_person || null,
+          pair.customDate,
+          pair.source_godown_id,
+          pair.target_godown_id,
+          pair.source_godown_name,
+          pair.target_godown_name,
+          JSON.stringify(pair.products),
+          pair.transport_name,
+          pair.lr_number,
+          pair.delivery_person,
           added_by,
-          from_place || sourceName.replace(/_/g, ' ').toUpperCase(),
-          to_place || targetName.replace(/_/g, ' ').toUpperCase()
+          pair.from_place,
+          pair.to_place
         ]
       );
-      challan_id = challanRes.rows[0].id;
-    } catch (challanErr) {
-      console.log('Challan creation log:', challanErr.message);
+
+      challansCreated.push({
+        id: challanRes.rows[0].id,
+        number: challan_number,
+        source: pair.source_godown_name,
+        target: pair.target_godown_name,
+        itemCount: pair.products.length
+      });
     }
 
     await client.query('COMMIT');
-    res.status(200).json({ message: 'Transfer successful', challan_id, challan_number });
+
+    res.status(200).json({
+      message: 'Stock transferred successfully',
+      count: rawItems.length,
+      challans: challansCreated,
+      challan_id: challansCreated[0]?.id || null,
+      challan_number: challansCreated[0]?.number || null
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error in transferStock:', err.message);
-    res.status(500).json({ message: 'Failed to transfer', error: err.message });
+    res.status(500).json({ message: 'Failed to transfer stock', error: err.message });
   } finally {
     client.release();
   }
